@@ -1,0 +1,200 @@
+-- ============================
+-- PERMIT SHERIFF DATABASE SETUP
+-- Postgres-compatible
+-- ============================
+
+-- Optional: drop existing tables (for dev resets)
+DROP TABLE IF EXISTS enforcement_actions CASCADE;
+DROP TABLE IF EXISTS permits CASCADE;
+DROP TABLE IF EXISTS permit_statutes CASCADE;
+DROP TABLE IF EXISTS jurisdictions CASCADE;
+DROP TABLE IF EXISTS organizations CASCADE;
+
+-- 1) ORGANIZATIONS (builders / contractors)
+CREATE TABLE organizations (
+    id              BIGSERIAL PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    contact_email   VARCHAR(255),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 2) JURISDICTIONS (cities, counties)
+CREATE TABLE jurisdictions (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,       -- e.g. 'City of Miami'
+    code        VARCHAR(50) UNIQUE NOT NULL, -- e.g. 'MIA'
+    state       CHAR(2) NOT NULL,            -- e.g. 'FL'
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 3) PERMIT STATUTES / REVIEW RULES (Law Clock Engine)
+CREATE TABLE permit_statutes (
+    id                  BIGSERIAL PRIMARY KEY,
+    jurisdiction_id     BIGINT NOT NULL REFERENCES jurisdictions(id),
+    permit_type         VARCHAR(100) NOT NULL,  -- e.g. 'Residential Reno'
+    review_limit_days   INTEGER NOT NULL,       -- 30, 45, etc
+    refund_percent      NUMERIC(5,2) NOT NULL,  -- e.g. 10.00
+    statute_reference   VARCHAR(255) NOT NULL,  -- e.g. 'Florida 553.79'
+    notes               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 4) PERMITS (matches your Streamlit watchlist)
+CREATE TABLE permits (
+    id                  BIGSERIAL PRIMARY KEY,
+    permit_external_id  VARCHAR(50) NOT NULL,          -- 'MIA-24-001'
+    organization_id     BIGINT NOT NULL REFERENCES organizations(id),
+    jurisdiction_id     BIGINT NOT NULL REFERENCES jurisdictions(id),
+
+    address             VARCHAR(255) NOT NULL,
+    permit_type         VARCHAR(100) NOT NULL,         -- 'Residential Reno'
+    status              VARCHAR(100) NOT NULL,         -- 'Under Review', etc.
+
+    submitted_date      DATE NOT NULL,
+    statute_limit_days  INTEGER NOT NULL,              -- snapshot from permit_statutes
+    refund_owed_cents   BIGINT NOT NULL DEFAULT 0,     -- store as cents
+
+    -- derived days open, stored for convenience
+    days_open           INTEGER GENERATED ALWAYS AS (
+        GREATEST(0, (CURRENT_DATE - submitted_date))
+    ) STORED,
+
+    violation           BOOLEAN NOT NULL DEFAULT FALSE,
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_permits_org ON permits (organization_id);
+CREATE INDEX idx_permits_jurisdiction ON permits (jurisdiction_id);
+CREATE INDEX idx_permits_violation ON permits (violation);
+
+-- 5) ENFORCEMENT ACTIONS (hash + letter history)
+CREATE TABLE enforcement_actions (
+    id                  BIGSERIAL PRIMARY KEY,
+    permit_id           BIGINT NOT NULL REFERENCES permits(id),
+    organization_id     BIGINT NOT NULL REFERENCES organizations(id),
+    jurisdiction_id     BIGINT NOT NULL REFERENCES jurisdictions(id),
+
+    action_time         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    tx_hash             VARCHAR(100) NOT NULL,
+    letter_pdf_url      TEXT,
+    letter_text         TEXT NOT NULL,
+    served              BOOLEAN NOT NULL DEFAULT FALSE,
+    served_via          VARCHAR(50),           -- 'email', 'upload', 'mail', etc.
+    notes               TEXT
+);
+
+CREATE INDEX idx_enforcement_permit ON enforcement_actions (permit_id);
+CREATE INDEX idx_enforcement_org ON enforcement_actions (organization_id);
+
+-- ============================
+-- SEED DATA (matches your mock)
+-- ============================
+
+-- 1) ORG
+INSERT INTO organizations (name, contact_email)
+VALUES ('Bayfront Builders LLC', 'permits@bayfrontbuilders.com');
+
+-- 2) JURISDICTIONS
+INSERT INTO jurisdictions (name, code, state)
+VALUES 
+  ('City of Miami', 'MIA', 'FL'),
+  ('City of Jacksonville', 'JAX', 'FL');
+
+-- 3) STATUTES (Florida 553.79 style rules)
+INSERT INTO permit_statutes (
+    jurisdiction_id, permit_type, review_limit_days, refund_percent, statute_reference, notes
+)
+SELECT id, 'Residential Reno', 30, 10.00, 'Florida 553.79', 'Residential review limit'
+FROM jurisdictions WHERE code = 'MIA';
+
+INSERT INTO permit_statutes (
+    jurisdiction_id, permit_type, review_limit_days, refund_percent, statute_reference, notes
+)
+SELECT id, 'Commercial HVAC', 10, 10.00, 'Florida 553.79', 'Commercial intake / review'
+FROM jurisdictions WHERE code = 'MIA';
+
+INSERT INTO permit_statutes (
+    jurisdiction_id, permit_type, review_limit_days, refund_percent, statute_reference, notes
+)
+SELECT id, 'New Construction', 45, 10.00, 'Florida 553.79', 'New construction review limit'
+FROM jurisdictions WHERE code = 'JAX';
+
+-- 4) PERMITS (3 records like your DataFrame)
+-- Assume: org_id = 1, MIA = 1, JAX = 2
+INSERT INTO permits (
+    permit_external_id, organization_id, jurisdiction_id,
+    address, permit_type, status,
+    submitted_date, statute_limit_days, refund_owed_cents, violation
+)
+VALUES
+    -- MIA-24-001: Residential Reno, 45 days open, limit 30, violation, $450
+    (
+        'MIA-24-001', 
+        1, 
+        (SELECT id FROM jurisdictions WHERE code = 'MIA'),
+        '120 Ocean Dr, Miami',
+        'Residential Reno',
+        'Under Review',
+        CURRENT_DATE - INTERVAL '45 days',
+        30,
+        45000,
+        TRUE
+    ),
+    -- MIA-24-009: Commercial HVAC, 5 days open, limit 10, no violation
+    (
+        'MIA-24-009', 
+        1, 
+        (SELECT id FROM jurisdictions WHERE code = 'MIA'),
+        '88 Biscayne Blvd',
+        'Commercial HVAC',
+        'In-Take',
+        CURRENT_DATE - INTERVAL '5 days',
+        10,
+        0,
+        FALSE
+    ),
+    -- JAX-24-882: New Construction, 62 days open, limit 45, violation, $1200
+    (
+        'JAX-24-882', 
+        1, 
+        (SELECT id FROM jurisdictions WHERE code = 'JAX'),
+        '400 Bay St, Jax',
+        'New Construction',
+        'Comments Pending',
+        CURRENT_DATE - INTERVAL '62 days',
+        45,
+        120000,
+        TRUE
+    );
+
+-- ============================
+-- SAMPLE QUERIES (optional)
+-- ============================
+
+-- Dashboard metrics
+-- Active permits for org 1
+-- SELECT COUNT(*) FROM permits WHERE organization_id = 1;
+
+-- Statute violations
+-- SELECT COUNT(*) FROM permits WHERE organization_id = 1 AND violation = TRUE;
+
+-- Recoverable refunds (USD)
+-- SELECT SUM(refund_owed_cents) / 100.0 AS recoverable_refunds_usd
+-- FROM permits WHERE organization_id = 1 AND violation = TRUE;
+
+-- Watchlist table (like Streamlit df)
+-- SELECT
+--     permit_external_id    AS "Permit ID",
+--     address               AS "Address",
+--     permit_type           AS "Type",
+--     submitted_date        AS "Submitted",
+--     status                AS "Status",
+--     statute_limit_days    AS "Statute Limit",
+--     days_open             AS "Days Open",
+--     violation             AS "Violation",
+--     CONCAT('$', TO_CHAR(refund_owed_cents / 100.0, 'FM999,999,990.00')) AS "Refund Owed"
+-- FROM permits
+-- WHERE organization_id = 1
+-- ORDER BY submitted_date DESC;
